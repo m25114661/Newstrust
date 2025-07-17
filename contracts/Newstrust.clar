@@ -8,14 +8,24 @@
 (define-constant ERR_VOTING_CLOSED (err u104))
 (define-constant ERR_ALREADY_FACT_CHECKED (err u105))
 (define-constant ERR_INVALID_RATING (err u106))
+(define-constant ERR_POOL_NOT_FOUND (err u107))
+(define-constant ERR_INSUFFICIENT_POOL_BALANCE (err u108))
+(define-constant ERR_POOL_ALREADY_EXISTS (err u109))
+(define-constant ERR_INVALID_POOL_PARAMS (err u110))
+(define-constant ERR_POOL_CLOSED (err u111))
+(define-constant ERR_ALREADY_CONTRIBUTED (err u112))
 
 (define-constant MIN_STAKE u1000000)
 (define-constant VOTING_PERIOD u144)
 (define-constant FACT_CHECK_REWARD u500000)
 (define-constant EDITORIAL_REWARD u300000)
+(define-constant MIN_POOL_CONTRIBUTION u100000)
+(define-constant POOL_DURATION u1008)
+(define-constant MAX_POOL_CONTRIBUTORS u200)
 
 (define-data-var next-article-id uint u1)
 (define-data-var platform-fee uint u50000)
+(define-data-var next-pool-id uint u1)
 
 (define-map articles
   uint
@@ -69,6 +79,45 @@
 (define-map article-voters
   uint
   (list 100 principal)
+)
+
+(define-map reward-pools
+  uint
+  {
+    creator: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    total-amount: uint,
+    current-amount: uint,
+    quality-threshold: uint,
+    created-at: uint,
+    expires-at: uint,
+    is-active: bool,
+    distributed: bool
+  }
+)
+
+(define-map pool-contributions
+  {pool-id: uint, contributor: principal}
+  {
+    amount: uint,
+    timestamp: uint
+  }
+)
+
+(define-map pool-contributors
+  uint
+  (list 200 principal)
+)
+
+(define-map pool-article-rewards
+  {pool-id: uint, article-id: uint}
+  {
+    author-reward: uint,
+    fact-checker-bonus: uint,
+    voter-bonus: uint,
+    distributed: bool
+  }
 )
 
 (define-public (submit-article (title (string-ascii 200)) (content-hash (string-ascii 64)))
@@ -331,4 +380,252 @@
     (var-set platform-fee new-fee)
     (ok true)
   )
+)
+
+(define-public (create-reward-pool (title (string-ascii 100)) (description (string-ascii 500)) (quality-threshold uint) (initial-amount uint))
+  (let
+    (
+      (pool-id (var-get next-pool-id))
+      (current-height stacks-block-height)
+    )
+    (asserts! (>= quality-threshold u50) ERR_INVALID_POOL_PARAMS)
+    (asserts! (<= quality-threshold u100) ERR_INVALID_POOL_PARAMS)
+    (asserts! (>= initial-amount MIN_POOL_CONTRIBUTION) ERR_INVALID_POOL_PARAMS)
+    (asserts! (>= (stx-get-balance tx-sender) initial-amount) ERR_INSUFFICIENT_STAKE)
+    
+    (try! (stx-transfer? initial-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set reward-pools pool-id
+      {
+        creator: tx-sender,
+        title: title,
+        description: description,
+        total-amount: initial-amount,
+        current-amount: initial-amount,
+        quality-threshold: quality-threshold,
+        created-at: current-height,
+        expires-at: (+ current-height POOL_DURATION),
+        is-active: true,
+        distributed: false
+      }
+    )
+    
+    (map-set pool-contributions {pool-id: pool-id, contributor: tx-sender}
+      {
+        amount: initial-amount,
+        timestamp: current-height
+      }
+    )
+    
+    (map-set pool-contributors pool-id
+      (unwrap! (as-max-len? (list tx-sender) u200) ERR_NOT_AUTHORIZED)
+    )
+    
+    (var-set next-pool-id (+ pool-id u1))
+    (ok pool-id)
+  )
+)
+
+(define-public (contribute-to-pool (pool-id uint) (amount uint))
+  (let
+    (
+      (pool (unwrap! (map-get? reward-pools pool-id) ERR_POOL_NOT_FOUND))
+      (current-height stacks-block-height)
+      (existing-contribution (map-get? pool-contributions {pool-id: pool-id, contributor: tx-sender}))
+    )
+    (asserts! (get is-active pool) ERR_POOL_CLOSED)
+    (asserts! (< current-height (get expires-at pool)) ERR_POOL_CLOSED)
+    (asserts! (>= amount MIN_POOL_CONTRIBUTION) ERR_INVALID_POOL_PARAMS)
+    (asserts! (>= (stx-get-balance tx-sender) amount) ERR_INSUFFICIENT_STAKE)
+    (asserts! (is-none existing-contribution) ERR_ALREADY_CONTRIBUTED)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set reward-pools pool-id
+      (merge pool
+        {
+          total-amount: (+ (get total-amount pool) amount),
+          current-amount: (+ (get current-amount pool) amount)
+        }
+      )
+    )
+    
+    (map-set pool-contributions {pool-id: pool-id, contributor: tx-sender}
+      {
+        amount: amount,
+        timestamp: current-height
+      }
+    )
+    
+    (map-set pool-contributors pool-id
+      (unwrap! (as-max-len? (append (default-to (list) (map-get? pool-contributors pool-id)) tx-sender) u200) ERR_NOT_AUTHORIZED)
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-pool-reward (pool-id uint) (article-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? reward-pools pool-id) ERR_POOL_NOT_FOUND))
+      (article (unwrap! (map-get? articles article-id) ERR_ARTICLE_NOT_FOUND))
+      (current-height stacks-block-height)
+      (existing-reward (map-get? pool-article-rewards {pool-id: pool-id, article-id: article-id}))
+    )
+    (asserts! (get is-active pool) ERR_POOL_CLOSED)
+    (asserts! (is-eq (get status article) "approved") ERR_NOT_AUTHORIZED)
+    (asserts! (>= (get fact-check-score article) (get quality-threshold pool)) ERR_NOT_AUTHORIZED)
+    (asserts! (>= (get editorial-score article) (get quality-threshold pool)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none existing-reward) ERR_NOT_AUTHORIZED)
+    (asserts! (> (get current-amount pool) u0) ERR_INSUFFICIENT_POOL_BALANCE)
+    
+    (let
+      (
+        (pool-third (/ (get current-amount pool) u3))
+        (total-reward (if (< pool-third u2000000) pool-third u2000000))
+        (author-reward (/ (* total-reward u60) u100))
+        (fact-checker-bonus (/ (* total-reward u25) u100))
+        (voter-bonus (/ (* total-reward u15) u100))
+      )
+      (map-set pool-article-rewards {pool-id: pool-id, article-id: article-id}
+        {
+          author-reward: author-reward,
+          fact-checker-bonus: fact-checker-bonus,
+          voter-bonus: voter-bonus,
+          distributed: false
+        }
+      )
+      
+      (map-set reward-pools pool-id
+        (merge pool {current-amount: (- (get current-amount pool) total-reward)})
+      )
+      
+      (ok {author-reward: author-reward, fact-checker-bonus: fact-checker-bonus, voter-bonus: voter-bonus})
+    )
+  )
+)
+
+(define-public (distribute-pool-rewards (pool-id uint) (article-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? reward-pools pool-id) ERR_POOL_NOT_FOUND))
+      (article (unwrap! (map-get? articles article-id) ERR_ARTICLE_NOT_FOUND))
+      (reward-data (unwrap! (map-get? pool-article-rewards {pool-id: pool-id, article-id: article-id}) ERR_NOT_AUTHORIZED))
+      (checkers (default-to (list) (map-get? article-fact-checkers article-id)))
+      (voters (default-to (list) (map-get? article-voters article-id)))
+    )
+    (asserts! (not (get distributed reward-data)) ERR_NOT_AUTHORIZED)
+    
+    (try! (as-contract (stx-transfer? (get author-reward reward-data) tx-sender (get author article))))
+    
+    (let
+      (
+        (checker-count (len checkers))
+        (voter-count (len voters))
+        (individual-checker-bonus (if (> checker-count u0) (/ (get fact-checker-bonus reward-data) checker-count) u0))
+        (individual-voter-bonus (if (> voter-count u0) (/ (get voter-bonus reward-data) voter-count) u0))
+      )
+      (distribute-checker-bonuses checkers individual-checker-bonus)
+      (distribute-voter-bonuses voters individual-voter-bonus)
+      
+      (map-set pool-article-rewards {pool-id: pool-id, article-id: article-id}
+        (merge reward-data {distributed: true})
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-private (distribute-checker-bonuses (checkers (list 50 principal)) (bonus uint))
+  (if (> bonus u0)
+    (begin
+      (fold distribute-single-checker-bonus checkers bonus)
+      true
+    )
+    true
+  )
+)
+
+(define-private (distribute-voter-bonuses (voters (list 100 principal)) (bonus uint))
+  (if (> bonus u0)
+    (begin
+      (fold distribute-single-voter-bonus voters bonus)
+      true
+    )
+    true
+  )
+)
+
+(define-private (distribute-single-checker-bonus (checker principal) (bonus uint))
+  (begin
+    (unwrap! (as-contract (stx-transfer? bonus tx-sender checker)) bonus)
+    bonus
+  )
+)
+
+(define-private (distribute-single-voter-bonus (voter principal) (bonus uint))
+  (begin
+    (unwrap! (as-contract (stx-transfer? bonus tx-sender voter)) bonus)
+    bonus
+  )
+)
+
+(define-public (close-expired-pool (pool-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? reward-pools pool-id) ERR_POOL_NOT_FOUND))
+      (current-height stacks-block-height)
+      (contributors (default-to (list) (map-get? pool-contributors pool-id)))
+    )
+    (asserts! (>= current-height (get expires-at pool)) ERR_POOL_CLOSED)
+    (asserts! (get is-active pool) ERR_NOT_AUTHORIZED)
+    
+    (let
+      (
+        (remaining-amount (get current-amount pool))
+        (contributor-count (len contributors))
+        (refund-per-contributor (if (> contributor-count u0) (/ remaining-amount contributor-count) u0))
+      )
+      (fold refund-contributor contributors true)
+      
+      (map-set reward-pools pool-id
+        (merge pool {is-active: false, current-amount: u0})
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-private (refund-contributor (contributor principal) (acc bool))
+  (begin
+    (unwrap! (as-contract (stx-transfer? u0 tx-sender contributor)) false)
+    acc
+  )
+)
+
+(define-read-only (get-reward-pool (pool-id uint))
+  (map-get? reward-pools pool-id)
+)
+
+(define-read-only (get-pool-contribution (pool-id uint) (contributor principal))
+  (map-get? pool-contributions {pool-id: pool-id, contributor: contributor})
+)
+
+(define-read-only (get-pool-contributors (pool-id uint))
+  (default-to (list) (map-get? pool-contributors pool-id))
+)
+
+(define-read-only (get-pool-article-reward (pool-id uint) (article-id uint))
+  (map-get? pool-article-rewards {pool-id: pool-id, article-id: article-id})
+)
+
+(define-read-only (get-next-pool-id)
+  (var-get next-pool-id)
+)
+
+(define-read-only (get-active-pools)
+  (ok true)
 )
