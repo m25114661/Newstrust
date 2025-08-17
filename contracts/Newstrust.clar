@@ -14,6 +14,11 @@
 (define-constant ERR_INVALID_POOL_PARAMS (err u110))
 (define-constant ERR_POOL_CLOSED (err u111))
 (define-constant ERR_ALREADY_CONTRIBUTED (err u112))
+(define-constant ERR_UPDATE_NOT_FOUND (err u113))
+(define-constant ERR_INVALID_UPDATE_TYPE (err u114))
+(define-constant ERR_UPDATE_ALREADY_VOTED (err u115))
+(define-constant ERR_UPDATE_VOTING_CLOSED (err u116))
+(define-constant ERR_UPDATE_NOT_PENDING (err u117))
 
 (define-constant MIN_STAKE u1000000)
 (define-constant VOTING_PERIOD u144)
@@ -22,10 +27,13 @@
 (define-constant MIN_POOL_CONTRIBUTION u100000)
 (define-constant POOL_DURATION u1008)
 (define-constant MAX_POOL_CONTRIBUTORS u200)
+(define-constant UPDATE_VOTING_PERIOD u72)
+(define-constant UPDATE_STAKE u250000)
 
 (define-data-var next-article-id uint u1)
 (define-data-var platform-fee uint u50000)
 (define-data-var next-pool-id uint u1)
+(define-data-var next-update-id uint u1)
 
 (define-map articles
   uint
@@ -118,6 +126,42 @@
     voter-bonus: uint,
     distributed: bool
   }
+)
+
+(define-map article-updates
+  uint
+  {
+    article-id: uint,
+    author: principal,
+    update-type: (string-ascii 20),
+    title: (string-ascii 200),
+    content-hash: (string-ascii 64),
+    reasoning: (string-ascii 500),
+    timestamp: uint,
+    voting-deadline: uint,
+    status: (string-ascii 20),
+    approval-score: uint,
+    stake: uint
+  }
+)
+
+(define-map update-votes
+  {update-id: uint, voter: principal}
+  {
+    vote: bool,
+    timestamp: uint,
+    stake: uint
+  }
+)
+
+(define-map update-voters
+  uint
+  (list 100 principal)
+)
+
+(define-map article-update-history
+  uint
+  (list 20 uint)
 )
 
 (define-public (submit-article (title (string-ascii 200)) (content-hash (string-ascii 64)))
@@ -629,3 +673,195 @@
 (define-read-only (get-active-pools)
   (ok true)
 )
+
+(define-public (submit-article-update (article-id uint) (update-type (string-ascii 20)) (title (string-ascii 200)) (content-hash (string-ascii 64)) (reasoning (string-ascii 500)))
+  (let
+    (
+      (article (unwrap! (map-get? articles article-id) ERR_ARTICLE_NOT_FOUND))
+      (update-id (var-get next-update-id))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq (get author article) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status article) "approved") ERR_NOT_AUTHORIZED)
+    (asserts! (or (is-eq update-type "correction") (is-eq update-type "clarification") (is-eq update-type "retraction")) ERR_INVALID_UPDATE_TYPE)
+    (asserts! (>= (stx-get-balance tx-sender) UPDATE_STAKE) ERR_INSUFFICIENT_STAKE)
+    
+    (try! (stx-transfer? UPDATE_STAKE tx-sender (as-contract tx-sender)))
+    
+    (map-set article-updates update-id
+      {
+        article-id: article-id,
+        author: tx-sender,
+        update-type: update-type,
+        title: title,
+        content-hash: content-hash,
+        reasoning: reasoning,
+        timestamp: current-height,
+        voting-deadline: (+ current-height UPDATE_VOTING_PERIOD),
+        status: "pending",
+        approval-score: u0,
+        stake: UPDATE_STAKE
+      }
+    )
+    
+    (var-set next-update-id (+ update-id u1))
+    (ok update-id)
+  )
+)
+
+(define-public (vote-on-update (update-id uint) (vote bool))
+  (let
+    (
+      (update-data (unwrap! (map-get? article-updates update-id) ERR_UPDATE_NOT_FOUND))
+      (current-height stacks-block-height)
+      (stake-amount (/ UPDATE_STAKE u4))
+    )
+    (asserts! (< current-height (get voting-deadline update-data)) ERR_UPDATE_VOTING_CLOSED)
+    (asserts! (is-eq (get status update-data) "pending") ERR_UPDATE_NOT_PENDING)
+    (asserts! (is-none (map-get? update-votes {update-id: update-id, voter: tx-sender})) ERR_UPDATE_ALREADY_VOTED)
+    (asserts! (>= (stx-get-balance tx-sender) stake-amount) ERR_INSUFFICIENT_STAKE)
+    
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set update-votes {update-id: update-id, voter: tx-sender}
+      {
+        vote: vote,
+        timestamp: current-height,
+        stake: stake-amount
+      }
+    )
+    
+    (map-set update-voters update-id
+      (unwrap! (as-max-len? (append (default-to (list) (map-get? update-voters update-id)) tx-sender) u100) ERR_NOT_AUTHORIZED)
+    )
+    
+    (update-approval-score update-id)
+    (ok true)
+  )
+)
+
+(define-public (finalize-update (update-id uint))
+  (let
+    (
+      (update-data (unwrap! (map-get? article-updates update-id) ERR_UPDATE_NOT_FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (>= current-height (get voting-deadline update-data)) ERR_UPDATE_VOTING_CLOSED)
+    (asserts! (is-eq (get status update-data) "pending") ERR_UPDATE_NOT_PENDING)
+    
+    (let
+      (
+        (approval-score (get approval-score update-data))
+        (final-status (if (>= approval-score u60) "approved" "rejected"))
+        (article-id (get article-id update-data))
+      )
+      (map-set article-updates update-id
+        (merge update-data {status: final-status})
+      )
+      
+      (if (is-eq final-status "approved")
+        (begin
+          (try! (add-to-update-history article-id update-id))
+          (try! (distribute-update-rewards update-id))
+          (ok "approved")
+        )
+        (begin
+          (try! (distribute-update-rewards update-id))
+          (ok "rejected")
+        )
+      )
+    )
+  )
+)
+
+(define-private (update-approval-score (update-id uint))
+  (let
+    (
+      (voters (default-to (list) (map-get? update-voters update-id)))
+      (positive-votes (fold calculate-update-positive-votes voters u0))
+      (total-votes (len voters))
+      (approval-rate (if (> total-votes u0) (/ (* positive-votes u100) total-votes) u0))
+    )
+    (map-set article-updates update-id
+      (merge
+        (unwrap-panic (map-get? article-updates update-id))
+        {approval-score: approval-rate}
+      )
+    )
+  )
+)
+
+(define-private (calculate-update-positive-votes (voter principal) (acc uint))
+  (let
+    (
+      (update-id (- (var-get next-update-id) u1))
+      (vote-data (map-get? update-votes {update-id: update-id, voter: voter}))
+    )
+    (match vote-data
+      vote (if (get vote vote) (+ acc u1) acc)
+      acc
+    )
+  )
+)
+
+(define-private (add-to-update-history (article-id uint) (update-id uint))
+  (let
+    (
+      (current-history (default-to (list) (map-get? article-update-history article-id)))
+    )
+    (map-set article-update-history article-id
+      (unwrap! (as-max-len? (append current-history update-id) u20) (err u999))
+    )
+    (ok true)
+  )
+)
+
+(define-private (distribute-update-rewards (update-id uint))
+  (let
+    (
+      (update-data (unwrap-panic (map-get? article-updates update-id)))
+      (voters (default-to (list) (map-get? update-voters update-id)))
+      (status (get status update-data))
+    )
+    (if (is-eq status "approved")
+      (begin
+        (try! (as-contract (stx-transfer? (get stake update-data) tx-sender (get author update-data))))
+        (fold reward-update-voter voters true)
+        (ok true)
+      )
+      (begin
+        (fold reward-update-voter voters true)
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (reward-update-voter (voter principal) (acc bool))
+  (begin
+    (unwrap! (as-contract (stx-transfer? u50000 tx-sender voter)) false)
+    acc
+  )
+)
+
+(define-read-only (get-article-updates (article-id uint))
+  (default-to (list) (map-get? article-update-history article-id))
+)
+
+(define-read-only (get-article-update (update-id uint))
+  (map-get? article-updates update-id)
+)
+
+(define-read-only (get-update-vote (update-id uint) (voter principal))
+  (map-get? update-votes {update-id: update-id, voter: voter})
+)
+
+(define-read-only (get-update-voters (update-id uint))
+  (default-to (list) (map-get? update-voters update-id))
+)
+
+(define-read-only (get-next-update-id)
+  (var-get next-update-id)
+)
+
+
