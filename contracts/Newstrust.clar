@@ -19,6 +19,14 @@
 (define-constant ERR_UPDATE_ALREADY_VOTED (err u115))
 (define-constant ERR_UPDATE_VOTING_CLOSED (err u116))
 (define-constant ERR_UPDATE_NOT_PENDING (err u117))
+(define-constant ERR_NOT_TRUSTED_ALERTER (err u118))
+(define-constant ERR_ALERT_NOT_FOUND (err u119))
+(define-constant ERR_ALREADY_SUBSCRIBED (err u120))
+(define-constant ERR_NOT_SUBSCRIBED (err u121))
+(define-constant ERR_INVALID_URGENCY_LEVEL (err u122))
+(define-constant ERR_ALERT_EXPIRED (err u123))
+(define-constant ERR_ALREADY_VERIFIED_SOURCE (err u124))
+(define-constant ERR_INSUFFICIENT_VERIFICATIONS (err u125))
 
 (define-constant MIN_STAKE u1000000)
 (define-constant VOTING_PERIOD u144)
@@ -29,11 +37,17 @@
 (define-constant MAX_POOL_CONTRIBUTORS u200)
 (define-constant UPDATE_VOTING_PERIOD u72)
 (define-constant UPDATE_STAKE u250000)
+(define-constant ALERT_STAKE u500000)
+(define-constant ALERT_EXPIRY_PERIOD u24)
+(define-constant MIN_VERIFICATIONS u3)
+(define-constant TRUSTED_ALERTER_MIN_REPUTATION u750)
+(define-constant ALERT_REWARD u100000)
 
 (define-data-var next-article-id uint u1)
 (define-data-var platform-fee uint u50000)
 (define-data-var next-pool-id uint u1)
 (define-data-var next-update-id uint u1)
+(define-data-var next-alert-id uint u1)
 
 (define-map articles
   uint
@@ -162,6 +176,63 @@
 (define-map article-update-history
   uint
   (list 20 uint)
+)
+
+;; Breaking News Alert System Maps
+(define-map breaking-news-alerts
+  uint
+  {
+    alerter: principal,
+    title: (string-ascii 200),
+    summary: (string-ascii 500),
+    content-hash: (string-ascii 64),
+    urgency-level: uint, ;; 1=low, 2=medium, 3=high, 4=critical
+    timestamp: uint,
+    expires-at: uint,
+    status: (string-ascii 20), ;; pending, verified, rejected, expired
+    verification-count: uint,
+    stake: uint
+  }
+)
+
+(define-map alert-source-verifications
+  {alert-id: uint, verifier: principal}
+  {
+    verified: bool,
+    source-url: (string-ascii 200),
+    evidence-hash: (string-ascii 64),
+    timestamp: uint,
+    stake: uint
+  }
+)
+
+(define-map alert-subscriptions
+  {subscriber: principal, urgency-level: uint}
+  {
+    subscribed-at: uint,
+    is-active: bool,
+    notifications-received: uint
+  }
+)
+
+(define-map trusted-alerters
+  principal
+  {
+    promoted-at: uint,
+    alerts-submitted: uint,
+    accuracy-rate: uint,
+    is-active: bool
+  }
+)
+
+(define-map alert-verifiers
+  uint
+  (list 20 principal)
+)
+
+(define-map alert-subscribers
+  {alert-id: uint, urgency-level: uint}
+  (list 500 principal)
 )
 
 (define-public (submit-article (title (string-ascii 200)) (content-hash (string-ascii 64)))
@@ -864,4 +935,209 @@
   (var-get next-update-id)
 )
 
+;; Breaking News Alert System Functions
+
+;; Submit a breaking news alert (trusted alerters or high reputation users)
+(define-public (submit-breaking-alert (title (string-ascii 200)) (summary (string-ascii 500)) (content-hash (string-ascii 64)) (urgency-level uint))
+  (let
+    (
+      (alert-id (var-get next-alert-id))
+      (current-height stacks-block-height)
+      (user-rep (get-user-reputation tx-sender))
+      (is-trusted (is-some (map-get? trusted-alerters tx-sender)))
+    )
+    (asserts! (and (> urgency-level u0) (<= urgency-level u4)) ERR_INVALID_URGENCY_LEVEL)
+    (asserts! (or is-trusted (>= (+ (get fact-check-score user-rep) (get editorial-score user-rep)) TRUSTED_ALERTER_MIN_REPUTATION)) ERR_NOT_TRUSTED_ALERTER)
+    (asserts! (>= (stx-get-balance tx-sender) ALERT_STAKE) ERR_INSUFFICIENT_STAKE)
+    
+    (try! (stx-transfer? ALERT_STAKE tx-sender (as-contract tx-sender)))
+    
+    (map-set breaking-news-alerts alert-id
+      {
+        alerter: tx-sender,
+        title: title,
+        summary: summary,
+        content-hash: content-hash,
+        urgency-level: urgency-level,
+        timestamp: current-height,
+        expires-at: (+ current-height ALERT_EXPIRY_PERIOD),
+        status: "pending",
+        verification-count: u0,
+        stake: ALERT_STAKE
+      }
+    )
+    
+    (var-set next-alert-id (+ alert-id u1))
+    (ok alert-id)
+  )
+)
+
+;; Verify alert source (community members)
+(define-public (verify-alert-source (alert-id uint) (verified bool) (source-url (string-ascii 200)) (evidence-hash (string-ascii 64)))
+  (let
+    (
+      (alert (unwrap! (map-get? breaking-news-alerts alert-id) ERR_ALERT_NOT_FOUND))
+      (current-height stacks-block-height)
+      (stake-amount (/ ALERT_STAKE u4))
+    )
+    (asserts! (< current-height (get expires-at alert)) ERR_ALERT_EXPIRED)
+    (asserts! (is-eq (get status alert) "pending") ERR_ALERT_EXPIRED)
+    (asserts! (is-none (map-get? alert-source-verifications {alert-id: alert-id, verifier: tx-sender})) ERR_ALREADY_VERIFIED_SOURCE)
+    (asserts! (>= (stx-get-balance tx-sender) stake-amount) ERR_INSUFFICIENT_STAKE)
+    
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set alert-source-verifications {alert-id: alert-id, verifier: tx-sender}
+      {
+        verified: verified,
+        source-url: source-url,
+        evidence-hash: evidence-hash,
+        timestamp: current-height,
+        stake: stake-amount
+      }
+    )
+    
+    (map-set alert-verifiers alert-id
+      (unwrap! (as-max-len? (append (default-to (list) (map-get? alert-verifiers alert-id)) tx-sender) u20) ERR_NOT_AUTHORIZED)
+    )
+    
+    (update-alert-verification-status alert-id)
+    (ok true)
+  )
+)
+
+;; Subscribe to breaking news alerts by urgency level
+(define-public (subscribe-to-alerts (urgency-level uint))
+  (let
+    (
+      (current-height stacks-block-height)
+      (existing-subscription (map-get? alert-subscriptions {subscriber: tx-sender, urgency-level: urgency-level}))
+    )
+    (asserts! (and (> urgency-level u0) (<= urgency-level u4)) ERR_INVALID_URGENCY_LEVEL)
+    (asserts! (is-none existing-subscription) ERR_ALREADY_SUBSCRIBED)
+    
+    (map-set alert-subscriptions {subscriber: tx-sender, urgency-level: urgency-level}
+      {
+        subscribed-at: current-height,
+        is-active: true,
+        notifications-received: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Promote user to trusted alerter (contract owner only)
+(define-public (promote-to-trusted-alerter (user principal))
+  (let
+    (
+      (current-height stacks-block-height)
+      (user-rep (get-user-reputation user))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (>= (+ (get fact-check-score user-rep) (get editorial-score user-rep)) TRUSTED_ALERTER_MIN_REPUTATION) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (map-get? trusted-alerters user)) ERR_ALREADY_SUBSCRIBED)
+    
+    (map-set trusted-alerters user
+      {
+        promoted-at: current-height,
+        alerts-submitted: u0,
+        accuracy-rate: u100,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Update alert verification status based on verifier consensus
+(define-private (update-alert-verification-status (alert-id uint))
+  (let
+    (
+      (verifiers (default-to (list) (map-get? alert-verifiers alert-id)))
+      (positive-verifications (fold calculate-positive-verifications verifiers u0))
+      (total-verifications (len verifiers))
+    )
+    (if (>= positive-verifications MIN_VERIFICATIONS)
+      (begin
+        (map-set breaking-news-alerts alert-id
+          (merge
+            (unwrap-panic (map-get? breaking-news-alerts alert-id))
+            {status: "verified", verification-count: positive-verifications}
+          )
+        )
+        (unwrap-panic (distribute-to-subscribers alert-id))
+        true
+      )
+      (if (>= total-verifications MIN_VERIFICATIONS)
+        (begin
+          (map-set breaking-news-alerts alert-id
+            (merge
+              (unwrap-panic (map-get? breaking-news-alerts alert-id))
+              {status: "rejected", verification-count: positive-verifications}
+            )
+          )
+          true
+        )
+        true
+      )
+    )
+  )
+)
+
+(define-private (calculate-positive-verifications (verifier principal) (acc uint))
+  (let
+    (
+      (alert-id (- (var-get next-alert-id) u1))
+      (verification (map-get? alert-source-verifications {alert-id: alert-id, verifier: verifier}))
+    )
+    (match verification
+      verify (if (get verified verify) (+ acc u1) acc)
+      acc
+    )
+  )
+)
+
+;; Distribute alert to subscribers
+(define-private (distribute-to-subscribers (alert-id uint))
+  (let
+    (
+      (alert (unwrap-panic (map-get? breaking-news-alerts alert-id)))
+      (urgency-level (get urgency-level alert))
+    )
+    ;; Reward alerter for successful alert
+    (try! (as-contract (stx-transfer? ALERT_REWARD tx-sender (get alerter alert))))
+    ;; In a real implementation, this would trigger notifications to all subscribers of this urgency level
+    (ok true)
+  )
+)
+
+;; Read-only functions for breaking news alerts
+(define-read-only (get-breaking-alert (alert-id uint))
+  (map-get? breaking-news-alerts alert-id)
+)
+
+(define-read-only (get-alert-verification (alert-id uint) (verifier principal))
+  (map-get? alert-source-verifications {alert-id: alert-id, verifier: verifier})
+)
+
+(define-read-only (get-alert-subscription (subscriber principal) (urgency-level uint))
+  (map-get? alert-subscriptions {subscriber: subscriber, urgency-level: urgency-level})
+)
+
+(define-read-only (get-trusted-alerter (user principal))
+  (map-get? trusted-alerters user)
+)
+
+(define-read-only (is-trusted-alerter (user principal))
+  (is-some (map-get? trusted-alerters user))
+)
+
+(define-read-only (get-alert-verifiers (alert-id uint))
+  (default-to (list) (map-get? alert-verifiers alert-id))
+)
+
+(define-read-only (get-next-alert-id)
+  (var-get next-alert-id)
+)
 
